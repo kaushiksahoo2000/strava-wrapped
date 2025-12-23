@@ -1,9 +1,9 @@
 /**
- * Strava Wrapped - Generate yearly running stats and commit to GitHub
+ * Strava Wrapped - Generate yearly activity stats and commit to GitHub
  *
  * This single-file script:
- * 1. Fetches all Run activities from Strava for a given year
- * 2. Computes summary statistics and highlights
+ * 1. Fetches all activities from Strava for a given year
+ * 2. Computes summary statistics by activity type
  * 3. Generates a Markdown file
  * 4. Commits it to a GitHub repo using a GitHub App
  */
@@ -127,7 +127,6 @@ async function stravaFetch<T>(
         headers: { Authorization: `Bearer ${currentAccessToken}` },
     });
 
-    // Handle token expiration
     if (response.status === 401 && !retried) {
         currentAccessToken = await refreshStravaToken(config);
         return stravaFetch(endpoint, config, true);
@@ -141,16 +140,14 @@ async function stravaFetch<T>(
     return response.json();
 }
 
-async function fetchAllRunsForYear(
-    config: Config
-): Promise<StravaActivity[]> {
+async function fetchAllActivitiesForYear(config: Config): Promise<StravaActivity[]> {
     const year = config.year;
     const startOfYear = new Date(year, 0, 1).getTime() / 1000;
     const endOfYear = new Date(year + 1, 0, 1).getTime() / 1000;
 
-    console.log(`📅 Fetching runs for ${year}...`);
+    console.log(`📅 Fetching activities for ${year}...`);
 
-    const allRuns: StravaActivity[] = [];
+    const allActivities: StravaActivity[] = [];
     let page = 1;
     const perPage = 200;
 
@@ -162,44 +159,46 @@ async function fetchAllRunsForYear(
 
         if (activities.length === 0) break;
 
-        // Filter to only Run activities
-        const runs = activities.filter(
-            (a) => a.type === "Run" || a.sport_type === "Run"
-        );
-        allRuns.push(...runs);
+        // Filter out activities with no moving time
+        const valid = activities.filter((a) => a.moving_time > 0);
+        allActivities.push(...valid);
 
-        console.log(`  Page ${page}: ${activities.length} activities, ${runs.length} runs`);
+        console.log(`  Page ${page}: ${activities.length} activities (${valid.length} valid)`);
 
         if (activities.length < perPage) break;
         page++;
     }
 
-    console.log(`✅ Found ${allRuns.length} total runs for ${year}`);
-    return allRuns;
+    console.log(`✅ Found ${allActivities.length} total activities for ${year}`);
+    return allActivities;
 }
 
 // ============================================================================
 // Stats Computation
 // ============================================================================
 
+interface ActivityTypeStats {
+    type: string;
+    count: number;
+    distanceMiles: number;
+    movingTimeMinutes: number;
+    elevationGainFeet: number;
+}
+
 interface Stats {
     year: number;
-    totals: {
-        runs: number;
+    overall: {
+        totalActivities: number;
         distanceMiles: number;
         movingTimeMinutes: number;
         elevationGainFeet: number;
-        averagePaceMinPerMile: number;
     };
+    byType: ActivityTypeStats[];
     highlights: {
-        longestRun: { name: string; date: string; distanceMiles: number } | null;
-        fastest5k: { name: string; date: string; paceMinPerMile: number } | null;
-        fastestPace: { name: string; date: string; paceMinPerMile: number } | null;
-    };
-    consistency: {
-        longestStreak: number;
-        mostCommonWeekday: string;
-        mostCommonHour: number;
+        longestByDistance: { name: string; type: string; date: string; distanceMiles: number } | null;
+        longestByTime: { name: string; type: string; date: string; durationMinutes: number } | null;
+        busiestDay: { date: string; count: number } | null;
+        mostCommonType: { type: string; count: number } | null;
     };
 }
 
@@ -207,12 +206,6 @@ interface Stats {
 const metersToMiles = (m: number) => m * 0.000621371;
 const metersToFeet = (m: number) => m * 3.28084;
 const secondsToMinutes = (s: number) => s / 60;
-
-function formatPace(minPerMile: number): string {
-    const mins = Math.floor(minPerMile);
-    const secs = Math.round((minPerMile - mins) * 60);
-    return `${mins}:${secs.toString().padStart(2, "0")}`;
-}
 
 function formatDuration(totalMinutes: number): string {
     const hours = Math.floor(totalMinutes / 60);
@@ -223,154 +216,108 @@ function formatDuration(totalMinutes: number): string {
     return `${mins}m`;
 }
 
-function computeStats(runs: StravaActivity[], year: number): Stats {
-    // Totals
-    const totalDistance = runs.reduce((sum, r) => sum + r.distance, 0);
-    const totalMovingTime = runs.reduce((sum, r) => sum + r.moving_time, 0);
-    const totalElevation = runs.reduce((sum, r) => sum + r.total_elevation_gain, 0);
+function formatPace(minPerMile: number): string {
+    const mins = Math.floor(minPerMile);
+    const secs = Math.round((minPerMile - mins) * 60);
+    return `${mins}:${secs.toString().padStart(2, "0")} /mile`;
+}
 
-    const totalDistanceMiles = metersToMiles(totalDistance);
-    const totalMovingTimeMinutes = secondsToMinutes(totalMovingTime);
-    const averagePace =
-        totalDistanceMiles > 0 ? totalMovingTimeMinutes / totalDistanceMiles : 0;
+function formatSpeed(mph: number): string {
+    return `${mph.toFixed(1)} mph`;
+}
 
-    // Longest run
-    const longestRun = runs.reduce<StravaActivity | null>((longest, run) => {
-        if (!longest || run.distance > longest.distance) return run;
+function formatDate(dateStr: string): string {
+    const d = new Date(dateStr);
+    return d.toLocaleDateString("en-US", {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+    });
+}
+
+function computeStats(activities: StravaActivity[], year: number): Stats {
+    // Overall totals
+    const totalDistance = activities.reduce((sum, a) => sum + a.distance, 0);
+    const totalMovingTime = activities.reduce((sum, a) => sum + a.moving_time, 0);
+    const totalElevation = activities.reduce((sum, a) => sum + a.total_elevation_gain, 0);
+
+    // Group by type
+    const byTypeMap: Record<string, StravaActivity[]> = {};
+    for (const activity of activities) {
+        const type = activity.type;
+        if (!byTypeMap[type]) byTypeMap[type] = [];
+        byTypeMap[type].push(activity);
+    }
+
+    // Compute per-type stats
+    const byType: ActivityTypeStats[] = Object.entries(byTypeMap)
+        .map(([type, acts]) => ({
+            type,
+            count: acts.length,
+            distanceMiles: Math.round(metersToMiles(acts.reduce((s, a) => s + a.distance, 0)) * 10) / 10,
+            movingTimeMinutes: Math.round(secondsToMinutes(acts.reduce((s, a) => s + a.moving_time, 0))),
+            elevationGainFeet: Math.round(metersToFeet(acts.reduce((s, a) => s + a.total_elevation_gain, 0))),
+        }))
+        .sort((a, b) => b.count - a.count); // Sort by count descending
+
+    // Highlights: longest by distance
+    const longestByDistance = activities.reduce<StravaActivity | null>((longest, act) => {
+        if (!longest || act.distance > longest.distance) return act;
         return longest;
     }, null);
 
-    // Fastest 5k (runs that are at least 5k)
-    const fiveKMeters = 5000;
-    const runsOver5k = runs.filter((r) => r.distance >= fiveKMeters);
-    const fastest5k = runsOver5k.reduce<StravaActivity | null>((fastest, run) => {
-        // Calculate pace for just the 5k portion (approximation: use average pace)
-        const paceSecPerMeter = run.moving_time / run.distance;
-        const time5k = paceSecPerMeter * fiveKMeters;
-        const currentFastestTime = fastest
-            ? (fastest.moving_time / fastest.distance) * fiveKMeters
-            : Infinity;
-        if (time5k < currentFastestTime) return run;
-        return fastest;
+    // Highlights: longest by time
+    const longestByTime = activities.reduce<StravaActivity | null>((longest, act) => {
+        if (!longest || act.moving_time > longest.moving_time) return act;
+        return longest;
     }, null);
 
-    // Fastest average pace (runs >= 3 miles)
-    const threeMilesMeters = 3 * 1609.34;
-    const runsOver3Miles = runs.filter((r) => r.distance >= threeMilesMeters);
-    const fastestPace = runsOver3Miles.reduce<StravaActivity | null>(
-        (fastest, run) => {
-            const pace = run.moving_time / run.distance; // sec per meter
-            const fastestPaceVal = fastest
-                ? fastest.moving_time / fastest.distance
-                : Infinity;
-            if (pace < fastestPaceVal) return run;
-            return fastest;
-        },
+    // Highlights: busiest day
+    const dayCount: Record<string, number> = {};
+    for (const act of activities) {
+        const day = act.start_date_local.split("T")[0];
+        dayCount[day] = (dayCount[day] || 0) + 1;
+    }
+    const busiestDayEntry = Object.entries(dayCount).reduce<[string, number] | null>(
+        (max, entry) => (!max || entry[1] > max[1] ? entry : max),
         null
     );
 
-    // Consistency: Longest daily streak
-    const runDates = new Set(
-        runs.map((r) => r.start_date_local.split("T")[0])
-    );
-    const sortedDates = Array.from(runDates).sort();
-    let longestStreak = 0;
-    let currentStreak = 0;
-    let prevDate: Date | null = null;
-
-    for (const dateStr of sortedDates) {
-        const date = new Date(dateStr);
-        if (prevDate) {
-            const diff =
-                (date.getTime() - prevDate.getTime()) / (1000 * 60 * 60 * 24);
-            if (diff === 1) {
-                currentStreak++;
-            } else {
-                currentStreak = 1;
-            }
-        } else {
-            currentStreak = 1;
-        }
-        longestStreak = Math.max(longestStreak, currentStreak);
-        prevDate = date;
-    }
-
-    // Most common weekday
-    const weekdays = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-    const weekdayCounts: Record<number, number> = {};
-    for (const run of runs) {
-        const day = new Date(run.start_date_local).getDay();
-        weekdayCounts[day] = (weekdayCounts[day] || 0) + 1;
-    }
-    const mostCommonWeekdayNum = Object.entries(weekdayCounts).reduce(
-        (max, [day, count]) =>
-            count > (weekdayCounts[max] || 0) ? parseInt(day) : max,
-        0
-    );
-
-    // Most common start hour
-    const hourCounts: Record<number, number> = {};
-    for (const run of runs) {
-        const hour = new Date(run.start_date_local).getHours();
-        hourCounts[hour] = (hourCounts[hour] || 0) + 1;
-    }
-    const mostCommonHour = Object.entries(hourCounts).reduce(
-        (max, [hour, count]) =>
-            count > (hourCounts[max] || 0) ? parseInt(hour) : max,
-        0
-    );
-
-    // Build stats object
-    const formatDate = (dateStr: string) => {
-        const d = new Date(dateStr);
-        return d.toLocaleDateString("en-US", {
-            month: "short",
-            day: "numeric",
-            year: "numeric",
-        });
-    };
+    // Highlights: most common type
+    const mostCommonType = byType.length > 0 ? byType[0] : null;
 
     return {
         year,
-        totals: {
-            runs: runs.length,
-            distanceMiles: Math.round(totalDistanceMiles * 10) / 10,
-            movingTimeMinutes: Math.round(totalMovingTimeMinutes),
+        overall: {
+            totalActivities: activities.length,
+            distanceMiles: Math.round(metersToMiles(totalDistance) * 10) / 10,
+            movingTimeMinutes: Math.round(secondsToMinutes(totalMovingTime)),
             elevationGainFeet: Math.round(metersToFeet(totalElevation)),
-            averagePaceMinPerMile: averagePace,
         },
+        byType,
         highlights: {
-            longestRun: longestRun
+            longestByDistance: longestByDistance
                 ? {
-                    name: longestRun.name,
-                    date: formatDate(longestRun.start_date_local),
-                    distanceMiles:
-                        Math.round(metersToMiles(longestRun.distance) * 100) / 100,
+                    name: longestByDistance.name,
+                    type: longestByDistance.type,
+                    date: formatDate(longestByDistance.start_date_local),
+                    distanceMiles: Math.round(metersToMiles(longestByDistance.distance) * 100) / 100,
                 }
                 : null,
-            fastest5k: fastest5k
+            longestByTime: longestByTime
                 ? {
-                    name: fastest5k.name,
-                    date: formatDate(fastest5k.start_date_local),
-                    paceMinPerMile:
-                        secondsToMinutes(fastest5k.moving_time) /
-                        metersToMiles(fastest5k.distance),
+                    name: longestByTime.name,
+                    type: longestByTime.type,
+                    date: formatDate(longestByTime.start_date_local),
+                    durationMinutes: Math.round(secondsToMinutes(longestByTime.moving_time)),
                 }
                 : null,
-            fastestPace: fastestPace
-                ? {
-                    name: fastestPace.name,
-                    date: formatDate(fastestPace.start_date_local),
-                    paceMinPerMile:
-                        secondsToMinutes(fastestPace.moving_time) /
-                        metersToMiles(fastestPace.distance),
-                }
+            busiestDay: busiestDayEntry
+                ? { date: formatDate(busiestDayEntry[0]), count: busiestDayEntry[1] }
                 : null,
-        },
-        consistency: {
-            longestStreak,
-            mostCommonWeekday: weekdays[mostCommonWeekdayNum],
-            mostCommonHour,
+            mostCommonType: mostCommonType
+                ? { type: mostCommonType.type, count: mostCommonType.count }
+                : null,
         },
     };
 }
@@ -379,64 +326,149 @@ function computeStats(runs: StravaActivity[], year: number): Stats {
 // Markdown Generation
 // ============================================================================
 
+// Emoji mapping for activity types
+const activityEmoji: Record<string, string> = {
+    Run: "🏃",
+    Ride: "🚴",
+    Swim: "🏊",
+    Walk: "🚶",
+    Hike: "🥾",
+    WeightTraining: "🏋️",
+    Workout: "💪",
+    Yoga: "🧘",
+    CrossFit: "🏋️",
+    Elliptical: "🔄",
+    StairStepper: "🪜",
+    Rowing: "🚣",
+    Kayaking: "🛶",
+    Canoeing: "🛶",
+    Surfing: "🏄",
+    Skateboard: "🛹",
+    InlineSkate: "🛼",
+    IceSkate: "⛸️",
+    Snowboard: "🏂",
+    AlpineSki: "⛷️",
+    NordicSki: "🎿",
+    Golf: "⛳",
+    Soccer: "⚽",
+    Tennis: "🎾",
+    Pickleball: "🏓",
+    Badminton: "🏸",
+    RockClimbing: "🧗",
+    VirtualRide: "🖥️🚴",
+    VirtualRun: "🖥️🏃",
+    EBikeRide: "🔋🚴",
+    Handcycle: "🦽",
+    Wheelchair: "🦽",
+};
+
+function getActivityEmoji(type: string): string {
+    return activityEmoji[type] || "🏅";
+}
+
 function generateMarkdown(stats: Stats): string {
     const lines: string[] = [];
 
-    lines.push(`# 🏃 Strava Wrapped ${stats.year}`);
+    lines.push(`# 🎉 Strava Wrapped ${stats.year}`);
     lines.push("");
-    lines.push(`Your running year in review.`);
+    lines.push(`> ✨ Your year in motion — ${stats.overall.totalActivities} activities and counting!`);
     lines.push("");
 
-    // Totals
-    lines.push(`## 📊 Totals`);
+    // Overall
+    lines.push(`## 📊 Year at a Glance`);
     lines.push("");
-    lines.push(`- **Total Runs:** ${stats.totals.runs}`);
-    lines.push(`- **Total Distance:** ${stats.totals.distanceMiles.toLocaleString()} miles`);
-    lines.push(`- **Total Time:** ${formatDuration(stats.totals.movingTimeMinutes)}`);
-    lines.push(`- **Total Elevation Gain:** ${stats.totals.elevationGainFeet.toLocaleString()} feet`);
-    lines.push(`- **Average Pace:** ${formatPace(stats.totals.averagePaceMinPerMile)} /mile`);
+    lines.push(`| Metric | Value |`);
+    lines.push(`|--------|-------|`);
+    lines.push(`| 🔢 **Activities** | ${stats.overall.totalActivities} |`);
+    lines.push(`| 📏 **Distance** | ${stats.overall.distanceMiles.toLocaleString()} miles |`);
+    lines.push(`| ⏱️ **Moving Time** | ${formatDuration(stats.overall.movingTimeMinutes)} |`);
+    lines.push(`| ⛰️ **Elevation Gain** | ${stats.overall.elevationGainFeet.toLocaleString()} ft |`);
     lines.push("");
+
+    // By Activity Type
+    lines.push(`## 🏅 By Activity Type`);
+    lines.push("");
+
+    for (const typeStats of stats.byType) {
+        const emoji = getActivityEmoji(typeStats.type);
+        lines.push(`### ${emoji} ${typeStats.type}`);
+        lines.push("");
+        lines.push(`| Stat | Value |`);
+        lines.push(`|------|-------|`);
+        lines.push(`| Activities | ${typeStats.count} |`);
+        if (typeStats.distanceMiles > 0) {
+            lines.push(`| Distance | ${typeStats.distanceMiles.toLocaleString()} mi |`);
+        }
+        lines.push(`| Time | ${formatDuration(typeStats.movingTimeMinutes)} |`);
+        if (typeStats.elevationGainFeet > 0) {
+            lines.push(`| Elevation | ${typeStats.elevationGainFeet.toLocaleString()} ft |`);
+        }
+        // Average pace/speed for distance-based activities
+        if (typeStats.distanceMiles > 0 && typeStats.movingTimeMinutes > 0) {
+            const avgPace = typeStats.movingTimeMinutes / typeStats.distanceMiles;
+            const avgSpeed = typeStats.distanceMiles / (typeStats.movingTimeMinutes / 60);
+            if (typeStats.type === "Run" || typeStats.type === "Walk" || typeStats.type === "Hike") {
+                lines.push(`| Avg Pace | ${formatPace(avgPace)} |`);
+            } else {
+                lines.push(`| Avg Speed | ${formatSpeed(avgSpeed)} |`);
+            }
+        }
+        lines.push("");
+    }
 
     // Highlights
     lines.push(`## 🏆 Highlights`);
     lines.push("");
 
-    if (stats.highlights.longestRun) {
-        const lr = stats.highlights.longestRun;
-        lines.push(`### Longest Run`);
-        lines.push(`- **${lr.name}** on ${lr.date}`);
-        lines.push(`- Distance: ${lr.distanceMiles} miles`);
+    if (stats.highlights.longestByDistance) {
+        const h = stats.highlights.longestByDistance;
+        const emoji = getActivityEmoji(h.type);
+        lines.push(`### 📏 Longest by Distance`);
+        lines.push(`> ${emoji} **${h.name}**`);
+        lines.push(`>`);
+        lines.push(`> ${h.distanceMiles} miles • ${h.type} • ${h.date}`);
         lines.push("");
     }
 
-    if (stats.highlights.fastest5k) {
-        const f5k = stats.highlights.fastest5k;
-        lines.push(`### Fastest 5K Pace`);
-        lines.push(`- **${f5k.name}** on ${f5k.date}`);
-        lines.push(`- Pace: ${formatPace(f5k.paceMinPerMile)} /mile`);
+    if (stats.highlights.longestByTime) {
+        const h = stats.highlights.longestByTime;
+        const emoji = getActivityEmoji(h.type);
+        lines.push(`### ⏱️ Longest by Time`);
+        lines.push(`> ${emoji} **${h.name}**`);
+        lines.push(`>`);
+        lines.push(`> ${formatDuration(h.durationMinutes)} • ${h.type} • ${h.date}`);
         lines.push("");
     }
 
-    if (stats.highlights.fastestPace) {
-        const fp = stats.highlights.fastestPace;
-        lines.push(`### Fastest Average Pace (≥3 mi)`);
-        lines.push(`- **${fp.name}** on ${fp.date}`);
-        lines.push(`- Pace: ${formatPace(fp.paceMinPerMile)} /mile`);
+    if (stats.highlights.busiestDay) {
+        const h = stats.highlights.busiestDay;
+        lines.push(`### 📅 Busiest Day`);
+        lines.push(`> 🔥 **${h.date}**`);
+        lines.push(`>`);
+        lines.push(`> ${h.count} activities in one day!`);
         lines.push("");
     }
 
-    // Consistency
-    lines.push(`## 📅 Consistency`);
-    lines.push("");
-    lines.push(`- **Longest Streak:** ${stats.consistency.longestStreak} consecutive days`);
-    lines.push(`- **Favorite Day:** ${stats.consistency.mostCommonWeekday}`);
-    lines.push(`- **Favorite Time:** ${stats.consistency.mostCommonHour}:00`);
-    lines.push("");
+    if (stats.highlights.mostCommonType) {
+        const h = stats.highlights.mostCommonType;
+        const emoji = getActivityEmoji(h.type);
+        lines.push(`### ❤️ Favorite Activity`);
+        lines.push(`> ${emoji} **${h.type}**`);
+        lines.push(`>`);
+        lines.push(`> ${h.count} times this year`);
+        lines.push("");
+    }
 
     // Footer
     lines.push(`---`);
     lines.push("");
-    lines.push(`*Generated on ${new Date().toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })} with [Strava Wrapped](https://github.com/${process.env.GITHUB_OWNER}/${process.env.GITHUB_REPO})*`);
+    lines.push(`<p align="center">`);
+    lines.push(`  <em>Generated on ${new Date().toLocaleDateString("en-US", {
+        month: "long",
+        day: "numeric",
+        year: "numeric",
+    })} • Powered by Strava</em>`);
+    lines.push(`</p>`);
 
     return lines.join("\n");
 }
@@ -458,8 +490,8 @@ function createJWT(appId: string, privateKey: string): string {
 
     const header = { alg: "RS256", typ: "JWT" };
     const payload = {
-        iat: now - 60, // Issued 60 seconds ago (clock skew)
-        exp: now + 600, // Expires in 10 minutes
+        iat: now - 60,
+        exp: now + 600,
         iss: appId,
     };
 
@@ -527,9 +559,7 @@ async function getExistingFile(
         }
     );
 
-    if (response.status === 404) {
-        return null;
-    }
+    if (response.status === 404) return null;
 
     if (!response.ok) {
         const text = await response.text();
@@ -584,33 +614,27 @@ async function upsertFile(
 async function main() {
     console.log("🚀 Strava Wrapped Generator\n");
 
-    // Load configuration
     const config = loadConfig();
     console.log(`📆 Year: ${config.year}`);
     console.log(`📁 Target: ${config.github.owner}/${config.github.repo}`);
     console.log(`🧪 Dry Run: ${config.dryRun}\n`);
 
-    // Initialize Strava token
     currentAccessToken = config.strava.accessToken;
 
-    // Fetch runs
-    const runs = await fetchAllRunsForYear(config);
+    const activities = await fetchAllActivitiesForYear(config);
 
-    if (runs.length === 0) {
-        console.log("⚠️  No runs found for this year. Exiting.");
+    if (activities.length === 0) {
+        console.log("⚠️  No activities found for this year. Exiting.");
         return;
     }
 
-    // Compute stats
     console.log("\n📊 Computing stats...");
-    const stats = computeStats(runs, config.year);
+    const stats = computeStats(activities, config.year);
 
-    // Generate Markdown
     console.log("📝 Generating Markdown...");
     const markdown = generateMarkdown(stats);
     const filePath = `wrapped/${config.year}.md`;
 
-    // Dry run: print and exit
     if (config.dryRun) {
         console.log("\n" + "=".repeat(60));
         console.log("DRY RUN - Generated Markdown:");
@@ -622,10 +646,8 @@ async function main() {
         return;
     }
 
-    // Get GitHub installation token
     const ghToken = await getInstallationToken(config);
 
-    // Check if file exists
     console.log(`\n🔍 Checking for existing file: ${filePath}`);
     const existingFile = await getExistingFile(
         ghToken,
@@ -634,7 +656,6 @@ async function main() {
         filePath
     );
 
-    // Check if content is identical
     if (existingFile) {
         const existingContent = Buffer.from(existingFile.content, "base64").toString("utf-8");
         if (existingContent === markdown) {
@@ -646,7 +667,6 @@ async function main() {
         console.log("📄 File does not exist, will create");
     }
 
-    // Commit file
     const commitMessage = `🏃 Add Strava Wrapped ${config.year}`;
     console.log(`\n📤 Committing: ${commitMessage}`);
 
