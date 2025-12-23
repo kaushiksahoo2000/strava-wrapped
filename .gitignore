@@ -1,0 +1,29 @@
+# Environment variables
+.env
+.env.local
+
+# GitHub App private key
+private-key.pem
+*.pem
+
+# Dependencies
+node_modules/
+
+# TypeScript build output
+dist/
+*.js
+*.js.map
+*.d.ts
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor directories
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Generated output (optional - uncomment if you don't want to commit wrapped files)
+# wrapped/
