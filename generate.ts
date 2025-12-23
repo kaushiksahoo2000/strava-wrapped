@@ -8,6 +8,7 @@
  * 4. Commits it to a GitHub repo using a GitHub App
  */
 
+import "dotenv/config";
 import * as fs from "fs";
 import * as crypto from "crypto";
 
